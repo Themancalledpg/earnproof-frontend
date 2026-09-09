@@ -1,9 +1,15 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
-import { getAddress, requestAccess, signMessage } from "@stellar/freighter-api";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { getAddress, requestAccess, signMessage } from "@stellar/freighter-api";
+import { ArtifactExport } from "@/components/proofs/artifact-export";
+import { PaymentListSkeleton } from "@/components/common/skeleton/payment-list-skeleton";
 import { appConfig } from "@/config/app";
 import { apiClient, bearer } from "@/lib/api/client";
+import { buildCredentialExport, buildVerificationLinkExport } from "@/lib/credentials/export";
+import { formatDateTime } from "@/lib/i18n";
+import { resolveIdempotencyKey, type IdempotencyState, type ProofIntent } from "@/lib/proofs/idempotency";
+import { createSubmissionGuard } from "@/lib/proofs/submission-guard";
 
 type SessionUser = {
   id: string;
@@ -53,6 +59,7 @@ export function CreateProofFlow() {
     () => initialSession?.user ?? null,
   );
   const [payments, setPayments] = useState<Payment[]>([]);
+  const [paymentsLoading, setPaymentsLoading] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [thresholdAmount, setThresholdAmount] = useState("100");
   const [periodStart, setPeriodStart] = useState("2026-08-01");
@@ -60,6 +67,34 @@ export function CreateProofFlow() {
   const [proof, setProof] = useState<ProofResponse | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [isSubmittingProof, setIsSubmittingProof] = useState(false);
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  const connectButtonRef = useRef<HTMLButtonElement>(null);
+  const wasConnectedRef = useRef(Boolean(initialSession?.user));
+  // Guards against duplicate proof-creation mutations: at most one active
+  // submission, and only the response belonging to that submission may
+  // update state. See lib/proofs/submission-guard.ts.
+  const submissionGuardRef = useRef(createSubmissionGuard());
+  const idempotencyRef = useRef<IdempotencyState | null>(null);
+
+  useEffect(() => {
+    if (error) {
+      errorRef.current?.focus();
+    }
+  }, [error]);
+
+  // Restore focus to the "Connect Freighter" button after disconnecting so
+  // keyboard focus doesn't fall back to <body> when the "Disconnect"
+  // button it was on unmounts. Only fires on the connected -> disconnected
+  // transition, not on initial mount.
+  useEffect(() => {
+    if (user) {
+      wasConnectedRef.current = true;
+    } else if (wasConnectedRef.current) {
+      wasConnectedRef.current = false;
+      connectButtonRef.current?.focus();
+    }
+  }, [user]);
 
   const selectedIncomePayments = useMemo(
     () =>
@@ -75,51 +110,57 @@ export function CreateProofFlow() {
   async function connectWallet() {
     setError(null);
     setStatus("Requesting Freighter wallet access...");
-    const walletAddress = await getFreighterAddress();
-    if (!walletAddress) {
+
+    try {
+      const walletAddress = await getFreighterAddress();
+      if (!walletAddress) {
+        setStatus(null);
+        setError("Freighter was not found or did not return a Stellar address.");
+        return;
+      }
+
+      const challenge = await apiClient<{
+        id: string;
+        message: string;
+        expiresAt: string;
+      }>({
+        path: "/auth/challenge",
+        method: "POST",
+        body: JSON.stringify({ walletAddress }),
+      });
+
+      setStatus("Waiting for wallet signature...");
+      const signature = await signFreighterMessage(challenge.message, walletAddress);
+      if (!signature) {
+        setStatus(null);
+        setError("Wallet did not return a signature for the challenge.");
+        return;
+      }
+
+      const verified = await apiClient<{
+        user: SessionUser;
+        session: { token: string; tokenType: "Bearer" };
+      }>({
+        path: "/auth/verify",
+        method: "POST",
+        body: JSON.stringify({
+          challengeId: challenge.id,
+          walletAddress,
+          signature,
+        }),
+      });
+
+      window.localStorage.setItem(
+        SESSION_KEY,
+        JSON.stringify({ token: verified.session.token, user: verified.user }),
+      );
+      setToken(verified.session.token);
+      setUser(verified.user);
+      setStatus("Wallet authenticated.");
+    } catch {
       setStatus(null);
-      setError("Freighter was not found or did not return a Stellar address.");
-      return;
+      setError("Wallet connection failed. Check Freighter and try again.");
     }
-
-    const challenge = await apiClient<{
-      id: string;
-      message: string;
-      expiresAt: string;
-    }>({
-      path: "/auth/challenge",
-      method: "POST",
-      body: JSON.stringify({ walletAddress }),
-    });
-
-    setStatus("Waiting for wallet signature...");
-    const signature = await signFreighterMessage(challenge.message, walletAddress);
-    if (!signature) {
-      setStatus(null);
-      setError("Wallet did not return a signature for the challenge.");
-      return;
-    }
-
-    const verified = await apiClient<{
-      user: SessionUser;
-      session: { token: string; tokenType: "Bearer" };
-    }>({
-      path: "/auth/verify",
-      method: "POST",
-      body: JSON.stringify({
-        challengeId: challenge.id,
-        walletAddress,
-        signature,
-      }),
-    });
-
-    window.localStorage.setItem(
-      SESSION_KEY,
-      JSON.stringify({ token: verified.session.token, user: verified.user }),
-    );
-    setToken(verified.session.token);
-    setUser(verified.user);
-    setStatus("Wallet authenticated.");
   }
 
   async function syncPayments() {
@@ -129,13 +170,22 @@ export function CreateProofFlow() {
 
     setError(null);
     setStatus("Syncing incoming Stellar testnet payments...");
-    await apiClient({
-      path: "/payments/sync",
-      method: "POST",
-      headers: bearer(token),
-    });
-    await refreshPayments(token);
-    setStatus("Payments synced.");
+    setPaymentsLoading(true);
+
+    try {
+      await apiClient({
+        path: "/payments/sync",
+        method: "POST",
+        headers: bearer(token),
+      });
+      await refreshPayments(token);
+      setStatus("Payments synced.");
+    } catch {
+      setStatus(null);
+      setError("Payment sync failed. Try again.");
+    } finally {
+      setPaymentsLoading(false);
+    }
   }
 
   async function refreshPayments(activeToken = token) {
@@ -143,11 +193,18 @@ export function CreateProofFlow() {
       return;
     }
 
-    const response = await apiClient<Payment[]>({
-      path: "/payments",
-      headers: bearer(activeToken),
-    });
-    setPayments(response);
+    setPaymentsLoading(true);
+    try {
+      const response = await apiClient<Payment[]>({
+        path: "/payments",
+        headers: bearer(activeToken),
+      });
+      setPayments(response);
+    } catch {
+      setError("Could not load payments. Try again.");
+    } finally {
+      setPaymentsLoading(false);
+    }
   }
 
   async function updateClassification(
@@ -159,13 +216,17 @@ export function CreateProofFlow() {
     }
 
     setError(null);
-    await apiClient<Payment>({
-      path: `/payments/${paymentId}/classification`,
-      method: "PATCH",
-      headers: bearer(token),
-      body: JSON.stringify({ classification }),
-    });
-    await refreshPayments(token);
+    try {
+      await apiClient<Payment>({
+        path: `/payments/${paymentId}/classification`,
+        method: "PATCH",
+        headers: bearer(token),
+        body: JSON.stringify({ classification }),
+      });
+      await refreshPayments(token);
+    } catch {
+      setError("Could not update the payment classification. Try again.");
+    }
   }
 
   async function createProof(event: FormEvent<HTMLFormElement>) {
@@ -180,30 +241,85 @@ export function CreateProofFlow() {
       return;
     }
 
+    // Reject a re-entrant call (a second click/Enter before the button's
+    // disabled state has re-rendered, or any other double-fire of this
+    // handler) instead of starting a second mutation. Only one submission
+    // may be active for this form at a time.
+    const submissionId = submissionGuardRef.current.begin();
+    if (submissionId === null) {
+      return;
+    }
+
+    setIsSubmittingProof(true);
     setError(null);
     setProof(null);
     setStatus("Creating signed minimum-income proof...");
 
-    const created = await apiClient<ProofResponse>({
-      path: "/proofs/minimum-income",
-      method: "POST",
-      headers: bearer(token),
-      body: JSON.stringify({
-        selectedPaymentIds: selectedIncomePayments.map((payment) => payment.id),
-        thresholdAmount,
-        assetCode: selectedIncomePayments[0].assetCode,
-        assetIssuer: selectedIncomePayments[0].assetIssuer ?? undefined,
-        periodStart: `${periodStart}T00:00:00.000Z`,
-        periodEnd: `${periodEnd}T23:59:59.000Z`,
-        expiresInDays: 30,
-      }),
-    });
+    const intent: ProofIntent = {
+      selectedPaymentIds: selectedIncomePayments.map((payment) => payment.id),
+      thresholdAmount,
+      assetCode: selectedIncomePayments[0].assetCode,
+      assetIssuer: selectedIncomePayments[0].assetIssuer ?? undefined,
+      periodStart: `${periodStart}T00:00:00.000Z`,
+      periodEnd: `${periodEnd}T23:59:59.000Z`,
+    };
+    // A retry of the same intent (same selection, threshold, and period)
+    // reuses the previous idempotency key; anything else mints a new one.
+    // See lib/proofs/idempotency.ts.
+    const idempotency = resolveIdempotencyKey(idempotencyRef.current, intent);
+    idempotencyRef.current = idempotency;
 
-    setProof(created);
-    setStatus("Proof created.");
+    try {
+      const created = await apiClient<ProofResponse>({
+        path: "/proofs/minimum-income",
+        method: "POST",
+        headers: { ...bearer(token), "Idempotency-Key": idempotency.key },
+        body: JSON.stringify({
+          selectedPaymentIds: intent.selectedPaymentIds,
+          thresholdAmount: intent.thresholdAmount,
+          assetCode: intent.assetCode,
+          assetIssuer: intent.assetIssuer,
+          periodStart: intent.periodStart,
+          periodEnd: intent.periodEnd,
+          expiresInDays: 30,
+        }),
+      });
+
+      // Drop this response if something (a wallet disconnect, most likely)
+      // invalidated this submission while the request was in flight — only
+      // the response belonging to the still-current submission may update
+      // success state.
+      if (!submissionGuardRef.current.isCurrent(submissionId)) {
+        return;
+      }
+
+      setProof(created);
+      setStatus("Proof created.");
+      // The intent this key covered has now succeeded; a future click,
+      // even with identical field values, is a new intent and should get
+      // its own key rather than silently reusing a completed one.
+      idempotencyRef.current = null;
+    } catch {
+      if (!submissionGuardRef.current.isCurrent(submissionId)) {
+        return;
+      }
+      setStatus(null);
+      setError("Proof creation failed. Check the selected payments and try again.");
+    } finally {
+      submissionGuardRef.current.end(submissionId);
+      setIsSubmittingProof(false);
+    }
   }
 
   function disconnect() {
+    // Any proof-creation request still in flight belongs to a session that
+    // no longer exists once the wallet is disconnected; invalidate it so
+    // its eventual response can't resurrect proof/error state for a user
+    // who has moved on, and so a fresh submit isn't stuck waiting on a
+    // request that may never resolve.
+    submissionGuardRef.current.invalidate();
+    idempotencyRef.current = null;
+    setIsSubmittingProof(false);
     window.localStorage.removeItem(SESSION_KEY);
     setToken(null);
     setUser(null);
@@ -224,8 +340,15 @@ export function CreateProofFlow() {
           </p>
         </div>
         {user ? (
-          <div className="grid gap-3 text-sm text-slate-300">
-            <p className="break-words">
+          <div className="grid min-w-0 gap-3 text-sm text-slate-300">
+            {/*
+              `break-words` (overflow-wrap) lets a long word wrap but does not
+              reduce the element's min-content width, so a 56-character wallet
+              address still forces the whole page ~400px wide - horizontal
+              scrolling at 320 CSS px / 400% zoom. `break-all` (word-break)
+              does reduce it, which is what an opaque identifier needs.
+            */}
+            <p className="break-all">
               Connected as <span className="text-cyan-200">{user.walletAddress}</span>
             </p>
             <button
@@ -240,6 +363,7 @@ export function CreateProofFlow() {
           <button
             className="h-10 w-fit rounded-md bg-cyan-300 px-4 text-xs font-semibold text-slate-950"
             onClick={connectWallet}
+            ref={connectButtonRef}
             type="button"
           >
             Connect Freighter
@@ -277,7 +401,9 @@ export function CreateProofFlow() {
         </div>
 
         <div className="grid gap-3">
-          {payments.length === 0 ? (
+          {paymentsLoading ? (
+            <PaymentListSkeleton />
+          ) : payments.length === 0 ? (
             <p className="rounded-md border border-white/10 bg-slate-950 p-4 text-sm text-slate-400">
               No payments loaded yet.
             </p>
@@ -335,18 +461,37 @@ export function CreateProofFlow() {
           />
         </div>
         <button
-          className="h-10 w-fit rounded-md bg-cyan-300 px-4 text-xs font-semibold text-slate-950 disabled:opacity-50"
-          disabled={!token || selectedIncomePayments.length === 0}
+          aria-describedby={error ? "create-proof-feedback" : undefined}
+          className="h-10 w-fit rounded-md bg-cyan-300 px-4 text-xs font-semibold text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+          disabled={!token || selectedIncomePayments.length === 0 || isSubmittingProof}
           type="submit"
         >
-          Create proof
+          {isSubmittingProof ? "Creating proof..." : "Create proof"}
         </button>
       </form>
 
       {status || error || proof ? (
-        <section className="rounded-lg border border-white/10 bg-slate-950 p-5 text-sm leading-6">
-          {status ? <p className="text-slate-300">{status}</p> : null}
-          {error ? <p className="text-rose-200">{error}</p> : null}
+        <section
+          className="rounded-lg border border-white/10 bg-slate-950 p-5 text-sm leading-6"
+          id="create-proof-feedback"
+        >
+          {status ? (
+            <p aria-live="polite" className="text-slate-300">
+              {status}
+            </p>
+          ) : null}
+          {error ? (
+            <p
+              aria-live="assertive"
+              className="text-rose-200 focus-visible:outline-none"
+              id="create-proof-error"
+              ref={errorRef}
+              role="alert"
+              tabIndex={-1}
+            >
+              {error}
+            </p>
+          ) : null}
           {proof ? (
             <div className="mt-4 grid gap-2 text-slate-300">
               <p>
@@ -364,6 +509,18 @@ export function CreateProofFlow() {
               >
                 Open public verification
               </a>
+              <ArtifactExport
+                plan={buildVerificationLinkExport(
+                  `${appConfig.appUrl}/verify?proof=${encodeURIComponent(proof.proofId)}`,
+                )}
+                title="Export verification link"
+              />
+              <ArtifactExport
+                plan={buildCredentialExport({
+                  credential: proof.credential,
+                })}
+                title="Export credential JSON"
+              />
             </div>
           ) : null}
         </section>
@@ -416,14 +573,17 @@ function PaymentRow({
         <p className="font-medium text-white">
           {payment.assetCode} incoming payment
         </p>
-        <p className="mt-1 break-words text-xs text-slate-500">
+        {/* Same reason as the wallet address above: an opaque hash needs
+            word-break, not overflow-wrap, to stop forcing a minimum width. */}
+        <p className="mt-1 break-all text-xs text-slate-400">
           {payment.stellarTransactionHash}
         </p>
-        <p className="mt-1 text-xs text-slate-500">
-          {new Date(payment.occurredAt).toLocaleString()}
+        <p className="mt-1 text-xs text-slate-400">
+          {formatDateTime(payment.occurredAt)}
         </p>
       </div>
       <select
+        aria-label="Payment classification"
         className="h-10 rounded-md border border-white/10 bg-slate-900 px-3 text-white"
         onChange={(event) =>
           onClassify(event.target.value as PaymentClassification)
@@ -452,10 +612,14 @@ function Field({
   onChange: (value: string) => void;
 }) {
   return (
-    <label className="grid gap-2 text-sm font-medium text-slate-200">
+    // `min-w-0` on the grid item and `w-full` on the control: without them
+    // the input keeps its intrinsic width (a `date` input is wide by
+    // default) and pushes past a narrow viewport, which forces horizontal
+    // scrolling at 320 CSS px / 400% zoom.
+    <label className="grid min-w-0 gap-2 text-sm font-medium text-slate-200">
       {label}
       <input
-        className="h-11 rounded-md border border-white/10 bg-slate-900 px-4 text-white"
+        className="h-11 w-full rounded-md border border-white/10 bg-slate-900 px-4 text-white"
         onChange={(event) => onChange(event.target.value)}
         type={type}
         value={value}
@@ -464,18 +628,33 @@ function Field({
   );
 }
 
+// The Freighter wallet SDK is loaded on demand, only once a worker actually
+// starts the connect flow on this route. This keeps `@stellar/freighter-api`
+// out of the initial First Load JS for /proofs (and, by construction,
+// out of every public route that never renders this component).
+async function loadFreighter(): Promise<{
+  getAddress: typeof getAddress;
+  requestAccess: typeof requestAccess;
+  signMessage: typeof signMessage;
+}> {
+  return import("@stellar/freighter-api");
+}
+
 async function getFreighterAddress() {
-  const access = await requestAccess().catch(() => null);
+  const freighter = await loadFreighter();
+  const access = await freighter.requestAccess().catch(() => null);
   if (access?.address) {
     return access.address;
   }
 
-  const address = await getAddress().catch(() => null);
+  const address = await freighter.getAddress().catch(() => null);
   return address?.address ?? null;
 }
 
 async function signFreighterMessage(message: string, walletAddress: string) {
-  const response = await signMessage(message, {
+  const freighter = await loadFreighter();
+  const response = await freighter
+    .signMessage(message, {
       networkPassphrase: appConfig.stellarNetworkPassphrase,
       address: walletAddress,
     })
